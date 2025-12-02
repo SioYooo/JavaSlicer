@@ -3,10 +3,17 @@ package es.upv.mist.slicing.cli;
 import com.github.javaparser.Problem;
 import com.github.javaparser.StaticJavaParser;
 import com.github.javaparser.ast.CompilationUnit;
+import com.github.javaparser.ast.Node;
 import com.github.javaparser.ast.NodeList;
+import com.github.javaparser.ast.body.CallableDeclaration;
+import com.github.javaparser.ast.body.Parameter;
+import com.github.javaparser.ast.body.VariableDeclarator;
 import com.github.javaparser.ast.comments.BlockComment;
 import com.github.javaparser.ast.nodeTypes.NodeWithName;
+import com.github.javaparser.ast.stmt.Statement;
 import com.github.javaparser.symbolsolver.resolution.typesolvers.JavaParserTypeSolver;
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
 import es.upv.mist.slicing.graphs.augmented.ASDG;
 import es.upv.mist.slicing.graphs.augmented.PSDG;
 import es.upv.mist.slicing.graphs.exceptionsensitive.ESSDG;
@@ -21,6 +28,8 @@ import org.apache.commons.cli.*;
 
 import java.io.File;
 import java.io.FileNotFoundException;
+import java.io.FileWriter;
+import java.io.IOException;
 import java.io.PrintWriter;
 import java.util.*;
 import java.util.logging.Level;
@@ -90,6 +99,10 @@ public class Slicer {
                 .builder("h").longOpt("help")
                 .desc("Shows this text")
                 .build());
+        OPTIONS.addOption(Option
+                .builder("a").longOpt("all")
+                .desc("Slice all variables in the project and export to JSON")
+                .build());
     }
 
     private final Set<File> dirIncludeSet = new HashSet<>();
@@ -103,22 +116,30 @@ public class Slicer {
         cliOpts = new DefaultParser().parse(OPTIONS, cliArgs);
         if (cliOpts.hasOption('h'))
             printHelp();
-        if (cliOpts.hasOption('c')) {
-            Matcher matcher = SC_PATTERN.matcher(cliOpts.getOptionValue("criterion"));
-            if (!matcher.matches())
-                throw new ParseException("Invalid format for slicing criterion, see --help for more details");
-            setScFile(matcher.group("file"));
-            setScLine(Integer.parseInt(matcher.group("line")));
-            String var = matcher.group("var");
-            if (var != null)
-                setScVar(var);
-        } else if (cliOpts.hasOption('f') && cliOpts.hasOption('l')) {
-            setScFile(cliOpts.getOptionValue('f'));
-            setScLine(((Number) cliOpts.getParsedOptionValue("l")).intValue());
-            if (cliOpts.hasOption('v'))
-                setScVar(cliOpts.getOptionValue('v'));
+        
+        if (cliOpts.hasOption('a')) {
+            // In 'all' mode, we don't need specific criterion arguments
+            if (cliOpts.hasOption('c') || (cliOpts.hasOption('f') && cliOpts.hasOption('l'))) {
+                System.out.println("Warning: Slicing criterion arguments ignored in 'all' mode.");
+            }
         } else {
-            throw new ParseException("Slicing criterion not specified: either use \"-c\" or \"-f\" and \"-l\".");
+            if (cliOpts.hasOption('c')) {
+                Matcher matcher = SC_PATTERN.matcher(cliOpts.getOptionValue("criterion"));
+                if (!matcher.matches())
+                    throw new ParseException("Invalid format for slicing criterion, see --help for more details");
+                setScFile(matcher.group("file"));
+                setScLine(Integer.parseInt(matcher.group("line")));
+                String var = matcher.group("var");
+                if (var != null)
+                    setScVar(var);
+            } else if (cliOpts.hasOption('f') && cliOpts.hasOption('l')) {
+                setScFile(cliOpts.getOptionValue('f'));
+                setScLine(((Number) cliOpts.getParsedOptionValue("l")).intValue());
+                if (cliOpts.hasOption('v'))
+                    setScVar(cliOpts.getOptionValue('v'));
+            } else {
+                throw new ParseException("Slicing criterion not specified: either use \"-c\" or \"-f\" and \"-l\".");
+            }
         }
 
         if (cliOpts.hasOption('o'))
@@ -186,8 +207,11 @@ public class Slicer {
         boolean scFileFound = false;
         for (File file : (Iterable<File>) findAllJavaFiles(dirIncludeSet)::iterator)
             scFileFound |= parse(file, units, problems);
-        if (!scFileFound)
+        
+        // In 'all' mode, we might not have scFile, but we need to parse all files in include dirs
+        if (!cliOpts.hasOption('a') && !scFileFound)
             parse(scFile, units, problems);
+            
         if (!problems.isEmpty()) {
             for (Problem p : problems)
                 System.out.println(" * " + p.getVerboseMessage());
@@ -206,6 +230,11 @@ public class Slicer {
         }
         Logger.getLogger(Logger.GLOBAL_LOGGER_NAME).log(Level.INFO, "Building the SDG");
         sdg.build(new NodeList<>(units));
+
+        if (cliOpts.hasOption('a')) {
+            sliceAll(sdg, units);
+            return;
+        }
 
         // Slice the SDG
         Logger.getLogger(Logger.GLOBAL_LOGGER_NAME).log(Level.INFO, "Searching for criterion and slicing");
@@ -231,13 +260,130 @@ public class Slicer {
         }
     }
 
+    private void sliceAll(SDG sdg, Set<CompilationUnit> units) {
+        Logger.getLogger(Logger.GLOBAL_LOGGER_NAME).log(Level.INFO, "Slicing all variables...");
+        List<Map<String, Object>> results = new ArrayList<>();
+        int eid = 0;
+
+        for (CompilationUnit cu : units) {
+            if (cu.getStorage().isEmpty()) continue;
+            String filePath = cu.getStorage().get().getPath().toString();
+            String fileName = cu.getStorage().get().getFileName();
+
+            List<CallableDeclaration> callables = cu.findAll(CallableDeclaration.class);
+            for (CallableDeclaration callable : callables) {
+                String functionName = callable.getNameAsString();
+                String className = "";
+                if (callable.getParentNode().isPresent() && callable.getParentNode().get() instanceof com.github.javaparser.ast.body.TypeDeclaration) {
+                    className = ((com.github.javaparser.ast.body.TypeDeclaration<?>) callable.getParentNode().get()).getNameAsString();
+                }
+                
+                String functionCode = callable.toString();
+                List<Map<String, Object>> slices = new ArrayList<>();
+
+                // Find variables
+                List<VariableDeclarator> vars = callable.findAll(VariableDeclarator.class);
+                // Also parameters
+                List<Parameter> params = callable.findAll(Parameter.class);
+
+                List<com.github.javaparser.ast.Node> allVars = new ArrayList<>();
+                allVars.addAll(vars);
+                allVars.addAll(params);
+
+                for (com.github.javaparser.ast.Node varNode : allVars) {
+                    String varName = "";
+                    int line = -1;
+                    if (varNode instanceof VariableDeclarator) {
+                        varName = ((VariableDeclarator) varNode).getNameAsString();
+                        line = ((VariableDeclarator) varNode).getBegin().map(p -> p.line).orElse(-1);
+                    } else if (varNode instanceof Parameter) {
+                        varName = ((Parameter) varNode).getNameAsString();
+                        line = ((Parameter) varNode).getBegin().map(p -> p.line).orElse(-1);
+                    }
+
+                    if (line == -1) continue;
+
+                    try {
+                        SlicingCriterion sc = new FileLineSlicingCriterion(new File(filePath), line, varName);
+                        Slice slice = sdg.slice(sc);
+                        
+                        // Process slice
+                        List<Map<String, Object>> nodesData = new ArrayList<>();
+                        
+                        // Get all statements in the function to map y_bwd
+                        List<Statement> statements = callable.findAll(Statement.class);
+                        
+                        // Optimization: Build a set of AST nodes in the slice
+                        Set<com.github.javaparser.ast.Node> slicedAstNodes = new HashSet<>();
+                        for (es.upv.mist.slicing.nodes.GraphNode<?> gn : slice.getGraphNodes()) {
+                            if (gn.getAstNode() != null) {
+                                slicedAstNodes.add(gn.getAstNode());
+                            }
+                        }
+                        
+                        for (Statement stmt : statements) {
+                            if (!stmt.getBegin().isPresent()) continue;
+                            
+                            boolean inSlice = slicedAstNodes.contains(stmt);
+                            
+                            Map<String, Object> nodeInfo = new HashMap<>();
+                            nodeInfo.put("line", stmt.getBegin().get().line);
+                            nodeInfo.put("code", stmt.toString());
+                            nodeInfo.put("y_fwd", 0); // Forward slicing not supported yet
+                            nodeInfo.put("y_bwd", inSlice ? 1 : 0);
+                            nodeInfo.put("id", String.valueOf(stmt.hashCode())); 
+                            
+                            nodesData.add(nodeInfo);
+                        }
+
+                        Map<String, Object> sliceData = new HashMap<>();
+                        Map<String, Object> criterion = new HashMap<>();
+                        criterion.put("variable", varName);
+                        criterion.put("line", line);
+                        sliceData.put("slice_criterion", criterion);
+                        sliceData.put("nodes", nodesData);
+                        sliceData.put("edges", new ArrayList<>()); // Empty for now
+
+                        slices.add(sliceData);
+
+                    } catch (Exception e) {
+                        System.err.println("Error slicing variable " + varName + " at line " + line + ": " + e.getMessage());
+                    }
+                }
+
+                if (!slices.isEmpty()) {
+                    Map<String, Object> funcResult = new HashMap<>();
+                    funcResult.put("eid", eid++);
+                    funcResult.put("function_name", functionName);
+                    funcResult.put("class_name", className);
+                    funcResult.put("file_name", fileName);
+                    funcResult.put("language", "java");
+                    funcResult.put("function_code", functionCode);
+                    funcResult.put("slices", slices);
+                    results.add(funcResult);
+                }
+            }
+        }
+
+        // Export to JSON
+        Gson gson = new GsonBuilder().setPrettyPrinting().create();
+        File jsonFile = new File(outputDir, "slicing_result.json");
+        outputDir.mkdirs();
+        try (FileWriter writer = new FileWriter(jsonFile)) {
+            gson.toJson(results, writer);
+            Logger.getLogger(Logger.GLOBAL_LOGGER_NAME).log(Level.INFO, "Exported JSON to " + jsonFile.getAbsolutePath());
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
     private boolean parse(File file, Set<CompilationUnit> units, List<Problem> problems) {
         try {
             units.add(StaticJavaParser.parse(file));
         } catch (FileNotFoundException e) {
             problems.add(new Problem(e.getLocalizedMessage(), null, e));
         }
-        return Objects.equals(file.getAbsoluteFile(), scFile.getAbsoluteFile());
+        return scFile != null && Objects.equals(file.getAbsoluteFile(), scFile.getAbsoluteFile());
     }
 
     protected Stream<File> findAllJavaFiles(Collection<File> files) {
