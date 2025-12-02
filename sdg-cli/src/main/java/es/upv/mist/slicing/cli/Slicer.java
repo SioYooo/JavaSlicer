@@ -391,6 +391,7 @@ public class Slicer {
                     
                     Map<String, Object> funcResult = new HashMap<>();
                     funcResult.put("eid", eid);
+                    funcResult.put("project_name", projectName);
                     funcResult.put("function_name", functionName);
                     funcResult.put("class_name", className);
                     funcResult.put("file_name", fileName);
