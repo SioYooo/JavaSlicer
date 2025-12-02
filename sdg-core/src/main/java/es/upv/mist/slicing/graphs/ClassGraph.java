@@ -439,14 +439,22 @@ public class ClassGraph extends DirectedPseudograph<ClassGraph.Vertex<?>, ClassG
             return; // nothing to do, it is final and cannot extend nor implement user-defined types
         ClassOrInterfaceDeclaration c = (ClassOrInterfaceDeclaration) v.declaration;
         c.getExtendedTypes().forEach(p -> {
-            Vertex<?> source = classDeclarationMap.get(mapKey(p.resolve()));
-            if (source != null && containsVertex(v))
-                addEdge(source, v, new ClassArc.Extends());
+            try {
+                Vertex<?> source = classDeclarationMap.get(mapKey(p.resolve()));
+                if (source != null && containsVertex(v))
+                    addEdge(source, v, new ClassArc.Extends());
+            } catch (UnsolvedSymbolException e) {
+                // Ignore missing types
+            }
         });
         c.getImplementedTypes().forEach(p -> {
-            Vertex<?> source = classDeclarationMap.get(mapKey(p.resolve()));
-            if (source != null && containsVertex(v))
-                addEdge(source, v, new ClassArc.Implements());
+            try {
+                Vertex<?> source = classDeclarationMap.get(mapKey(p.resolve()));
+                if (source != null && containsVertex(v))
+                    addEdge(source, v, new ClassArc.Implements());
+            } catch (UnsolvedSymbolException e) {
+                // Ignore missing types
+            }
         });
     }
 
