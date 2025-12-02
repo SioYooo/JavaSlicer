@@ -31,6 +31,9 @@ import java.io.FileNotFoundException;
 import java.io.FileWriter;
 import java.io.IOException;
 import java.io.PrintWriter;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.*;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -102,6 +105,11 @@ public class Slicer {
         OPTIONS.addOption(Option
                 .builder("a").longOpt("all")
                 .desc("Slice all variables in the project and export to JSON")
+                .build());
+        OPTIONS.addOption(Option
+                .builder("p").longOpt("project")
+                .hasArg().argName("project-name")
+                .desc("The name of the project (used for EID generation in -a mode)")
                 .build());
     }
 
@@ -263,12 +271,31 @@ public class Slicer {
     private void sliceAll(SDG sdg, Set<CompilationUnit> units) {
         Logger.getLogger(Logger.GLOBAL_LOGGER_NAME).log(Level.INFO, "Slicing all variables...");
         List<Map<String, Object>> results = new ArrayList<>();
-        int eid = 0;
+        String projectName = cliOpts.getOptionValue("p", "unknown_project");
 
         for (CompilationUnit cu : units) {
             if (cu.getStorage().isEmpty()) continue;
             String filePath = cu.getStorage().get().getPath().toString();
             String fileName = cu.getStorage().get().getFileName();
+            
+            // Try to make path relative to project root if possible, or just use filename for hash stability?
+            // User said "project name + file + variable". 
+            // We'll use the file name as it appears in the storage (absolute path usually).
+            // To be safe across environments, maybe we should try to relativize against include dirs?
+            // But for now, let's use the full path or just filename if that's what "file" implies.
+            // Given "project name + file", usually implies relative path within project.
+            // Let's try to find the relative path from the include directories.
+            
+            String relativePath = filePath;
+            for (File includeDir : dirIncludeSet) {
+                if (filePath.startsWith(includeDir.getAbsolutePath())) {
+                    relativePath = filePath.substring(includeDir.getAbsolutePath().length());
+                    if (relativePath.startsWith(File.separator)) {
+                        relativePath = relativePath.substring(1);
+                    }
+                    break;
+                }
+            }
 
             List<CallableDeclaration> callables = cu.findAll(CallableDeclaration.class);
             for (CallableDeclaration callable : callables) {
@@ -352,8 +379,18 @@ public class Slicer {
                 }
 
                 if (!slices.isEmpty()) {
+                    // Generate unique EID
+                    // Hash: project + file + variable (we use function name too to be more precise?)
+                    // User said "project name + file + variable".
+                    // But we are grouping by function in the output structure.
+                    // The 'eid' is per function entry in the JSON list.
+                    // So it should be hash of project + file + function.
+                    
+                    String uniqueString = projectName + "|" + relativePath + "|" + functionName;
+                    String eid = generateHash(uniqueString);
+                    
                     Map<String, Object> funcResult = new HashMap<>();
-                    funcResult.put("eid", eid++);
+                    funcResult.put("eid", eid);
                     funcResult.put("function_name", functionName);
                     funcResult.put("class_name", className);
                     funcResult.put("file_name", fileName);
@@ -374,6 +411,24 @@ public class Slicer {
             Logger.getLogger(Logger.GLOBAL_LOGGER_NAME).log(Level.INFO, "Exported JSON to " + jsonFile.getAbsolutePath());
         } catch (IOException e) {
             e.printStackTrace();
+        }
+    }
+
+    private String generateHash(String input) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] encodedhash = digest.digest(input.getBytes(StandardCharsets.UTF_8));
+            StringBuilder hexString = new StringBuilder(2 * encodedhash.length);
+            for (int i = 0; i < encodedhash.length; i++) {
+                String hex = Integer.toHexString(0xff & encodedhash[i]);
+                if(hex.length() == 1) {
+                    hexString.append('0');
+                }
+                hexString.append(hex);
+            }
+            return hexString.toString();
+        } catch (NoSuchAlgorithmException e) {
+            throw new RuntimeException(e);
         }
     }
 
