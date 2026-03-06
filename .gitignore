@@ -178,3 +178,4 @@ buildNumber.properties
 javaslicer_raw_java/
 data_raw_java/
 slice/
+*.json
