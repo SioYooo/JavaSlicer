@@ -29,6 +29,7 @@ public class InterproceduralDefinitionFinder extends InterproceduralActionFinder
     @Override
     protected void handleFormalAction(CallGraph.Vertex vertex, Definition def) {
         CFG cfg = cfgMap.get(vertex.getDeclaration());
+        if (cfg == null) return; // CFG not built (e.g. unresolved symbols)
         if (!def.isParameter() || !def.isPrimitive()) {
             FormalIONode formalOut = FormalIONode.createFormalOut(vertex.getDeclaration(), def.getName());
             Movable movable = new Movable(def.toUsage(cfg.getExitNode()), formalOut);

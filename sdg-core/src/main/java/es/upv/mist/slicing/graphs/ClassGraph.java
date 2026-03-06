@@ -225,7 +225,13 @@ public class ClassGraph extends DirectedPseudograph<ClassGraph.Vertex<?>, ClassG
             for (TypeDeclaration<?> type : types) {
                 Vertex<? extends TypeDeclaration<?>> subclassVertex = classDeclarationMap.get(mapKey(type));
                 if (!findAllFieldsOf(subclassVertex).isEmpty()) {
-                    ObjectTree newType = tree.addType(ASTUtils.resolvedTypeDeclarationToResolvedType(type.resolve()), level);
+                    ResolvedType resolvedType;
+                    try {
+                        resolvedType = ASTUtils.resolvedTypeDeclarationToResolvedType(type.resolve());
+                    } catch (RuntimeException e) {
+                        continue;
+                    }
+                    ObjectTree newType = tree.addType(resolvedType, level);
                     String[] newLevel = new String[level.length + 1];
                     System.arraycopy(level, 0, newLevel, 0, level.length);
                     newLevel[level.length] = newType.getMemberNode().getLabel();
@@ -439,14 +445,22 @@ public class ClassGraph extends DirectedPseudograph<ClassGraph.Vertex<?>, ClassG
             return; // nothing to do, it is final and cannot extend nor implement user-defined types
         ClassOrInterfaceDeclaration c = (ClassOrInterfaceDeclaration) v.declaration;
         c.getExtendedTypes().forEach(p -> {
-            Vertex<?> source = classDeclarationMap.get(mapKey(p.resolve()));
-            if (source != null && containsVertex(v))
-                addEdge(source, v, new ClassArc.Extends());
+            try {
+                Vertex<?> source = classDeclarationMap.get(mapKey(p.resolve()));
+                if (source != null && containsVertex(v))
+                    addEdge(source, v, new ClassArc.Extends());
+            } catch (RuntimeException e) {
+                // Skip unresolvable parent types (e.g. third-party dependencies)
+            }
         });
         c.getImplementedTypes().forEach(p -> {
-            Vertex<?> source = classDeclarationMap.get(mapKey(p.resolve()));
-            if (source != null && containsVertex(v))
-                addEdge(source, v, new ClassArc.Implements());
+            try {
+                Vertex<?> source = classDeclarationMap.get(mapKey(p.resolve()));
+                if (source != null && containsVertex(v))
+                    addEdge(source, v, new ClassArc.Implements());
+            } catch (RuntimeException e) {
+                // Skip unresolvable implemented types (e.g. third-party dependencies)
+            }
         });
     }
 

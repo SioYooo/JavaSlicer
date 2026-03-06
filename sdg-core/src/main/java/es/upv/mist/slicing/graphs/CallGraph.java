@@ -11,6 +11,7 @@ import com.github.javaparser.ast.nodeTypes.NodeWithSimpleName;
 import com.github.javaparser.ast.stmt.ExplicitConstructorInvocationStmt;
 import com.github.javaparser.ast.visitor.VoidVisitorAdapter;
 import com.github.javaparser.resolution.Resolvable;
+import com.github.javaparser.resolution.UnsolvedSymbolException;
 import com.github.javaparser.resolution.declarations.ResolvedMethodLikeDeclaration;
 import es.upv.mist.slicing.graphs.cfg.CFG;
 import es.upv.mist.slicing.nodes.GraphNode;
@@ -176,19 +177,31 @@ public class CallGraph extends DirectedPseudograph<CallGraph.Vertex, CallGraph.E
             // =============== Method calls ===============
             @Override
             public void visit(MethodCallExpr n, Void arg) {
-                n.resolve().toAst().ifPresent(decl -> createPolyEdges(decl, n));
+                try {
+                    n.resolve().toAst().ifPresent(decl -> createPolyEdges(decl, n));
+                } catch (RuntimeException e) {
+                    // Skip unresolvable method calls (e.g. third-party dependencies)
+                }
                 super.visit(n, arg);
             }
 
             @Override
             public void visit(ObjectCreationExpr n, Void arg) {
-                n.resolve().toAst().ifPresent(decl -> createNormalEdge(decl, n));
+                try {
+                    n.resolve().toAst().ifPresent(decl -> createNormalEdge(decl, n));
+                } catch (RuntimeException e) {
+                    // Skip unresolvable constructor calls (e.g. third-party dependencies)
+                }
                 super.visit(n, arg);
             }
 
             @Override
             public void visit(ExplicitConstructorInvocationStmt n, Void arg) {
-                n.resolve().toAst().ifPresent(decl -> createNormalEdge(decl, n));
+                try {
+                    n.resolve().toAst().ifPresent(decl -> createNormalEdge(decl, n));
+                } catch (RuntimeException e) {
+                    // Skip unresolvable explicit constructor invocations
+                }
                 super.visit(n, arg);
             }
 

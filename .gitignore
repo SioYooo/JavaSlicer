@@ -174,3 +174,7 @@ buildNumber.properties
 
 # End of https://www.gitignore.io/api/java,linux,macos,maven,intellij
 .attach*
+
+javaslicer_raw_java/
+data_raw_java/
+slice/

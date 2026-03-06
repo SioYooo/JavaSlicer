@@ -7,6 +7,7 @@ import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
 import com.github.javaparser.ast.body.ConstructorDeclaration;
 import com.github.javaparser.ast.body.MethodDeclaration;
 import com.github.javaparser.ast.visitor.VoidVisitorAdapter;
+import com.github.javaparser.resolution.UnsolvedSymbolException;
 import es.upv.mist.slicing.arcs.pdg.ControlDependencyArc;
 import es.upv.mist.slicing.arcs.pdg.DataDependencyArc;
 import es.upv.mist.slicing.arcs.sdg.CallArc;
@@ -125,10 +126,22 @@ public class SDG extends Graph implements Sliceable, Buildable<NodeList<Compilat
             createClassGraph(nodeList); // 0
             buildCFGs(nodeList);        // 1
             createCallGraph(nodeList);  // 2
-            dataFlowAnalysis();         // 3
+            try {
+                dataFlowAnalysis();         // 3
+            } catch (RuntimeException e) {
+                System.err.println("WARN: Data flow analysis partially failed: " + e.getMessage());
+            }
             buildAndCopyPDGs();         // 4
-            connectCalls();             // 5
-            createSummaryArcs();        // 6
+            try {
+                connectCalls();             // 5
+            } catch (RuntimeException e) {
+                System.err.println("WARN: Call connection partially failed: " + e.getMessage());
+            }
+            try {
+                createSummaryArcs();        // 6
+            } catch (RuntimeException e) {
+                System.err.println("WARN: Summary arc creation partially failed: " + e.getMessage());
+            }
         }
 
         /** Build a CFG per declaration found in the list of compilation units. */
@@ -140,9 +153,13 @@ public class SDG extends Graph implements Sliceable, Buildable<NodeList<Compilat
                             .map(ClassOrInterfaceDeclaration::isInterface).orElse(false);
                     if (n.isAbstract() || isInInterface)
                         return; // Allow abstract methods
-                    CFG cfg = createCFG();
-                    buildCFG(n, cfg);
-                    cfgMap.put(n, cfg);
+                    try {
+                        CFG cfg = createCFG();
+                        buildCFG(n, cfg);
+                        cfgMap.put(n, cfg);
+                    } catch (RuntimeException e) {
+                        System.err.println("WARN: Skipping method " + n.getNameAsString() + ": " + e.getMessage());
+                    }
                     super.visit(n, arg);
                 }
 
@@ -152,9 +169,13 @@ public class SDG extends Graph implements Sliceable, Buildable<NodeList<Compilat
                             .map(ClassOrInterfaceDeclaration::isInterface).orElse(false);
                     if (n.isAbstract() || isInInterface)
                         return; // Allow abstract methods
-                    CFG cfg = createCFG();
-                    buildCFG(n, cfg);
-                    cfgMap.put(n, cfg);
+                    try {
+                        CFG cfg = createCFG();
+                        buildCFG(n, cfg);
+                        cfgMap.put(n, cfg);
+                    } catch (RuntimeException e) {
+                        System.err.println("WARN: Skipping constructor " + n.getNameAsString() + ": " + e.getMessage());
+                    }
                     super.visit(n, arg);
                 }
             }, null);
@@ -186,12 +207,16 @@ public class SDG extends Graph implements Sliceable, Buildable<NodeList<Compilat
         /** Build a PDG per declaration, based on the CFGs built previously and enhanced by data analyses. */
         protected void buildAndCopyPDGs() {
             for (CFG cfg : cfgMap.values()) {
-                // 4.1, 4.2, 4.3
-                PDG pdg = createPDG(cfg);
-                pdg.build(cfg.getDeclaration());
-                // 4.4
-                pdg.vertexSet().forEach(SDG.this::addVertex);
-                pdg.edgeSet().forEach(arc -> addEdge(pdg.getEdgeSource(arc), pdg.getEdgeTarget(arc), arc));
+                try {
+                    // 4.1, 4.2, 4.3
+                    PDG pdg = createPDG(cfg);
+                    pdg.build(cfg.getDeclaration());
+                    // 4.4
+                    pdg.vertexSet().forEach(SDG.this::addVertex);
+                    pdg.edgeSet().forEach(arc -> addEdge(pdg.getEdgeSource(arc), pdg.getEdgeTarget(arc), arc));
+                } catch (RuntimeException e) {
+                    System.err.println("WARN: Skipping PDG: " + e.getMessage());
+                }
             }
         }
 

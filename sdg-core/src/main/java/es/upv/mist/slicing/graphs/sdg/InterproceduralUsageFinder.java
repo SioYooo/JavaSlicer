@@ -57,6 +57,7 @@ public class InterproceduralUsageFinder extends InterproceduralActionFinder<Usag
     @Override
     protected void handleFormalAction(CallGraph.Vertex vertex, Usage use) {
         CFG cfg = cfgMap.get(vertex.getDeclaration());
+        if (cfg == null) return; // CFG not built (e.g. unresolved symbols)
         FormalIONode formalIn = FormalIONode.createFormalIn(vertex.getDeclaration(), use.getName());
         Movable movable = new Movable(use.toDefinition(cfg.getRootNode()), formalIn);
         cfg.getRootNode().addVariableAction(movable);

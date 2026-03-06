@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(wc:*)",
+      "Bash(where:*)",
+      "Bash(find /e -maxdepth 4 -name \"mvn\" -type f 2>/dev/null; find /e -maxdepth 4 -name \"mvn.cmd\" -type f 2>/dev/null; find /c -maxdepth 5 -name \"mvn.cmd\" -type f 2>/dev/null | head -3)",
+      "Bash(find /e -maxdepth 5 -name \"mvn\" 2>/dev/null; find /e -maxdepth 5 -name \"mvn.cmd\" 2>/dev/null; find /c -maxdepth 5 -name \"mvn\" 2>/dev/null | head -5)",
+      "Bash(curl:*)",
+      "Bash(unzip:*)",
+      "Bash(export:*)",
+      "Bash(\"/e/Program Files/Java/jdk-21.0.10/bin/jar\" tf:*)",
+      "Bash(mvn package -DskipTests -pl sdg-core)",
+      "Read(//tmp/**)",
+      "Bash(iconv -f utf-8 -t utf-8 -c)",
+      "Bash(python3:*)",
+      "Bash(\"/e/Program Files/Java/jdk-21.0.10/bin/java\":*)",
+      "Bash(do echo:*)",
+      "Bash(tasklist:*)"
+    ]
+  }
+}
