@@ -285,6 +285,67 @@ if (absFilePath.startsWith(includePath)) {
 }
 ```
 
+### 9. Forward Slicing 支持
+
+**问题**：`y_fwd` 被硬编码为 `0`（`Slicer.java` 原注释：`// Forward slicing not supported yet`），无法产出正向切片标签。
+
+**修复**：新增 `ForwardClassicSlicingAlgorithm` + 在 `Slicer.java` 批量模式中增加正向切片计算。
+
+#### 新增文件：`sdg-core/.../slicing/ForwardClassicSlicingAlgorithm.java`
+
+继承 `ClassicSlicingAlgorithm`，仅覆盖 `pass()` 方法，将遍历方向从 backward（`incomingEdgesOf` + `getEdgeSource`）反转为 forward（`outgoingEdgesOf` + `getEdgeTarget`）。两遍 pass 的 ignore 条件完全不变（Horwitz-Reps-Binkley 对偶算法）：
+- Pass 1：忽略 interprocedural output arcs（不从被调方法上升至调用方）
+- Pass 2：忽略 interprocedural input arcs（不从调用方下降至被调方法）
+
+```java
+// 唯一改变：遍历方向
+// ClassicSlicingAlgorithm（backward）:
+for (Arc arc : graph.incomingEdgesOf(node)) { ... graph.getEdgeSource(arc) ... }
+
+// ForwardClassicSlicingAlgorithm（forward）:
+for (Arc arc : graph.outgoingEdgesOf(node)) { ... graph.getEdgeTarget(arc) ... }
+```
+
+#### 修改文件：`sdg-cli/.../cli/Slicer.java`
+
+在 `sliceAll()` 中，对每个切片准则额外执行一次正向切片：
+```java
+// 1. Backward slice（原逻辑，完全不变）
+Slice bwdSlice = sdg.slice(sc);
+Set<Integer> bwdSlicedLines = ...;
+
+// 2. Forward slice（新增，独立于 backward）
+SlicingCriterion fwdSc = new FileLineSlicingCriterion(...);
+ForwardClassicSlicingAlgorithm fwdAlgo = new ForwardClassicSlicingAlgorithm(sdg);
+Slice fwdSlice = fwdAlgo.traverse(fwdSc.findNode(sdg));
+Set<Integer> fwdSlicedLines = ...;
+
+// 3. 输出双标签
+nodeInfo.put("y_fwd", inFwdSlice ? 1 : 0);
+nodeInfo.put("y_bwd", inBwdSlice ? 1 : 0);
+```
+
+Forward slice 的计算包裹在 try-catch 中，失败时 `y_fwd` 默认为 `0`，不影响 `y_bwd`。
+
+#### 精度影响
+
+| 维度 | 影响 |
+|------|------|
+| **Backward slice (y_bwd)** | **零影响** — `sdg.slice(sc)` 的调用路径和所有现有类均未修改 |
+| **Forward slice (y_fwd)** | 使用经典两遍算法的正向对偶，SDG 已包含全部边信息，精度等同于 backward |
+| **设计选择** | Forward 使用 `ClassicSlicingAlgorithm` 基类而非 `ExceptionSensitiveSlicingAlgorithm`，因异常敏感规则（CC1/CC2、PPDG）为 backward 专用剪枝逻辑 |
+
+#### 验证结果（Example1.java, criterion: `sum` at line 3）
+
+```
+int sum = 0;                  y_bwd=1, y_fwd=1  ← criterion 自身
+int prod = 0;                 y_bwd=0, y_fwd=0  ← 无关
+sum += 1;                     y_bwd=0, y_fwd=1  ← sum 值正向传播
+prod += n;                    y_bwd=0, y_fwd=0  ← 无关
+System.out.println(sum);      y_bwd=0, y_fwd=1  ← sum 值正向传播
+System.out.println(prod);     y_bwd=0, y_fwd=0  ← 无关
+```
+
 ### 关于行号匹配的设计决策
 
 调查了是否使用 `line:column` 对代替纯行号进行切片标签匹配。结论：**保留行号匹配**。

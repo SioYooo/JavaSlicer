@@ -21,6 +21,7 @@ import es.upv.mist.slicing.graphs.exceptionsensitive.ESSDG;
 import es.upv.mist.slicing.graphs.jsysdg.JSysDG;
 import es.upv.mist.slicing.graphs.sdg.SDG;
 import es.upv.mist.slicing.slicing.FileLineSlicingCriterion;
+import es.upv.mist.slicing.slicing.ForwardClassicSlicingAlgorithm;
 import es.upv.mist.slicing.slicing.Slice;
 import es.upv.mist.slicing.slicing.SlicingCriterion;
 import es.upv.mist.slicing.utils.NodeHashSet;
@@ -360,36 +361,51 @@ public class Slicer {
 
                         try {
                             SlicingCriterion sc = new FileLineSlicingCriterion(new File(filePath), line, varName);
-                            Slice slice = sdg.slice(sc);
 
-                            // Process slice
+                            // --- Backward slice (existing logic, unchanged) ---
+                            Slice bwdSlice = sdg.slice(sc);
+
                             List<Map<String, Object>> nodesData = new ArrayList<>();
-
-                            // Get all statements in the function to map y_bwd
                             List<Statement> statements = callable.findAll(Statement.class);
 
-                            // Build a set of sliced line numbers for reliable matching
-                            // (JavaParser Node.equals/hashCode is unreliable for set lookups)
-                            Set<Integer> slicedLines = new HashSet<>();
-                            for (es.upv.mist.slicing.nodes.GraphNode<?> gn : slice.getGraphNodes()) {
+                            // Build a set of backward-sliced line numbers
+                            Set<Integer> bwdSlicedLines = new HashSet<>();
+                            for (es.upv.mist.slicing.nodes.GraphNode<?> gn : bwdSlice.getGraphNodes()) {
                                 if (gn.getAstNode() != null && gn.getAstNode().getBegin().isPresent()) {
-                                    slicedLines.add(gn.getAstNode().getBegin().get().line);
+                                    bwdSlicedLines.add(gn.getAstNode().getBegin().get().line);
                                 }
                             }
                             // Skip empty slices (method's CFG was not built due to unresolved symbols)
-                            if (slicedLines.isEmpty()) continue;
+                            if (bwdSlicedLines.isEmpty()) continue;
+
+                            // --- Forward slice (classic 2-pass on the same SDG, reversed direction) ---
+                            Set<Integer> fwdSlicedLines = new HashSet<>();
+                            try {
+                                SlicingCriterion fwdSc = new FileLineSlicingCriterion(new File(filePath), line, varName);
+                                Set<es.upv.mist.slicing.nodes.GraphNode<?>> criterionNodes = fwdSc.findNode(sdg);
+                                ForwardClassicSlicingAlgorithm fwdAlgo = new ForwardClassicSlicingAlgorithm(sdg);
+                                Slice fwdSlice = fwdAlgo.traverse(criterionNodes);
+                                for (es.upv.mist.slicing.nodes.GraphNode<?> gn : fwdSlice.getGraphNodes()) {
+                                    if (gn.getAstNode() != null && gn.getAstNode().getBegin().isPresent()) {
+                                        fwdSlicedLines.add(gn.getAstNode().getBegin().get().line);
+                                    }
+                                }
+                            } catch (Exception e) {
+                                System.err.println("WARN: Forward slicing failed for " + varName + " at line " + line + ": " + e.getMessage());
+                            }
 
                             for (Statement stmt : statements) {
                                 if (!stmt.getBegin().isPresent()) continue;
 
                                 com.github.javaparser.Position stmtPos = stmt.getBegin().get();
-                                boolean inSlice = slicedLines.contains(stmtPos.line);
+                                boolean inBwdSlice = bwdSlicedLines.contains(stmtPos.line);
+                                boolean inFwdSlice = fwdSlicedLines.contains(stmtPos.line);
 
                                 Map<String, Object> nodeInfo = new HashMap<>();
                                 nodeInfo.put("line", stmtPos.line);
                                 nodeInfo.put("code", stmt.toString());
-                                nodeInfo.put("y_fwd", 0); // Forward slicing not supported yet
-                                nodeInfo.put("y_bwd", inSlice ? 1 : 0);
+                                nodeInfo.put("y_fwd", inFwdSlice ? 1 : 0);
+                                nodeInfo.put("y_bwd", inBwdSlice ? 1 : 0);
                                 nodeInfo.put("id", stmtPos.line + ":" + stmtPos.column);
 
                                 nodesData.add(nodeInfo);
