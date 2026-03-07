@@ -15,7 +15,11 @@
       "Bash(python3:*)",
       "Bash(\"/e/Program Files/Java/jdk-21.0.10/bin/java\":*)",
       "Bash(do echo:*)",
-      "Bash(tasklist:*)"
+      "Bash(tasklist:*)",
+      "Bash(mkdir:*)",
+      "Bash(\"/e/Program Files/Java/jdk-21.0.10/bin/java.exe\":*)",
+      "Bash(cp:*)",
+      "Bash(rm:*)"
     ]
   }
 }

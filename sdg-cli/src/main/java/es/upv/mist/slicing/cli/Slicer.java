@@ -372,14 +372,13 @@ public class Slicer {
                             // Build a set of sliced line numbers for reliable matching
                             // (JavaParser Node.equals/hashCode is unreliable for set lookups)
                             Set<Integer> slicedLines = new HashSet<>();
-                            int graphNodeCount = 0;
                             for (es.upv.mist.slicing.nodes.GraphNode<?> gn : slice.getGraphNodes()) {
-                                graphNodeCount++;
                                 if (gn.getAstNode() != null && gn.getAstNode().getBegin().isPresent()) {
                                     slicedLines.add(gn.getAstNode().getBegin().get().line);
                                 }
                             }
-                            System.err.println("DEBUG-SLICE: var=" + varName + " line=" + line + " graphNodes=" + graphNodeCount + " slicedLines=" + slicedLines.size() + " stmts=" + statements.size());
+                            // Skip empty slices (method's CFG was not built due to unresolved symbols)
+                            if (slicedLines.isEmpty()) continue;
 
                             for (Statement stmt : statements) {
                                 if (!stmt.getBegin().isPresent()) continue;
