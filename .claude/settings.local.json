@@ -19,7 +19,16 @@
       "Bash(mkdir:*)",
       "Bash(\"/e/Program Files/Java/jdk-21.0.10/bin/java.exe\":*)",
       "Bash(cp:*)",
-      "Bash(rm:*)"
+      "Bash(rm:*)",
+      "Bash(conda install:*)",
+      "Bash(java:*)",
+      "Bash(mvn package:*)",
+      "Bash(grep:*)",
+      "Bash(python:*)",
+      "WebSearch",
+      "Bash(ls:*)",
+      "Bash(xargs cat:*)",
+      "Bash(pip install:*)"
     ]
   }
 }

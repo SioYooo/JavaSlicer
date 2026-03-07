@@ -316,11 +316,10 @@ public class Slicer {
             
             String relativePath = filePath;
             for (File includeDir : dirIncludeSet) {
-                if (filePath.startsWith(includeDir.getAbsolutePath())) {
-                    relativePath = filePath.substring(includeDir.getAbsolutePath().length());
-                    if (relativePath.startsWith(File.separator)) {
-                        relativePath = relativePath.substring(1);
-                    }
+                java.nio.file.Path includePath = includeDir.getAbsoluteFile().toPath().normalize();
+                java.nio.file.Path absFilePath = new File(filePath).getAbsoluteFile().toPath().normalize();
+                if (absFilePath.startsWith(includePath)) {
+                    relativePath = includePath.relativize(absFilePath).toString();
                     break;
                 }
             }
@@ -383,14 +382,15 @@ public class Slicer {
                             for (Statement stmt : statements) {
                                 if (!stmt.getBegin().isPresent()) continue;
 
-                                boolean inSlice = slicedLines.contains(stmt.getBegin().get().line);
+                                com.github.javaparser.Position stmtPos = stmt.getBegin().get();
+                                boolean inSlice = slicedLines.contains(stmtPos.line);
 
                                 Map<String, Object> nodeInfo = new HashMap<>();
-                                nodeInfo.put("line", stmt.getBegin().get().line);
+                                nodeInfo.put("line", stmtPos.line);
                                 nodeInfo.put("code", stmt.toString());
                                 nodeInfo.put("y_fwd", 0); // Forward slicing not supported yet
                                 nodeInfo.put("y_bwd", inSlice ? 1 : 0);
-                                nodeInfo.put("id", String.valueOf(stmt.hashCode()));
+                                nodeInfo.put("id", stmtPos.line + ":" + stmtPos.column);
 
                                 nodesData.add(nodeInfo);
                             }
@@ -411,7 +411,13 @@ public class Slicer {
                     }
 
                     if (!slices.isEmpty()) {
-                        String uniqueString = projectName + "|" + relativePath + "|" + functionName;
+                        StringBuilder sigBuilder = new StringBuilder("(");
+                        for (int pi = 0; pi < callable.getParameters().size(); pi++) {
+                            if (pi > 0) sigBuilder.append(",");
+                            sigBuilder.append(callable.getParameter(pi).getType().asString());
+                        }
+                        sigBuilder.append(")");
+                        String uniqueString = projectName + "|" + relativePath + "|" + functionName + "|" + sigBuilder.toString();
                         String eid = generateHash(uniqueString);
 
                         Map<String, Object> funcResult = new HashMap<>();
