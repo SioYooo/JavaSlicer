@@ -15,6 +15,7 @@ import com.github.javaparser.ast.stmt.Statement;
 import com.github.javaparser.symbolsolver.resolution.typesolvers.JavaParserTypeSolver;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
+import es.upv.mist.slicing.arcs.pdg.StructuralArc;
 import es.upv.mist.slicing.graphs.augmented.ASDG;
 import es.upv.mist.slicing.graphs.augmented.PSDG;
 import es.upv.mist.slicing.graphs.exceptionsensitive.ESSDG;
@@ -346,6 +347,66 @@ public class Slicer {
                     allVars.addAll(vars);
                     allVars.addAll(params);
 
+                    // --- Hoist statements outside allVars loop (invariant across variables) ---
+                    List<Statement> statements = callable.findAll(Statement.class);
+
+                    // Build line -> nodeId mapping (invariant across variables)
+                    Map<Integer, String> lineToNodeId = new HashMap<>();
+                    for (Statement stmt : statements) {
+                        if (!stmt.getBegin().isPresent()) continue;
+                        com.github.javaparser.Position pos = stmt.getBegin().get();
+                        lineToNodeId.putIfAbsent(pos.line, pos.line + ":" + pos.column);
+                    }
+
+                    // --- SDG edge export (once per function) ---
+                    Set<String> edgeDedup = new HashSet<>();
+                    List<Map<String, Object>> functionEdges = new ArrayList<>();
+
+                    for (es.upv.mist.slicing.arcs.Arc arc : sdg.edgeSet()) {
+                        if (arc instanceof StructuralArc) continue;
+
+                        // Map arc type -> {DFG, CFG, CG}
+                        String edgeType;
+                        if (arc.isDataDependencyArc()) {
+                            edgeType = "DFG";
+                        } else if (arc.isControlFlowArc() || arc.isControlDependencyArc()) {
+                            edgeType = "CFG";
+                        } else if (arc.isCallArc()) {
+                            edgeType = "CG";
+                        } else {
+                            edgeType = "DFG";  // ParameterInOut, Return, Summary, etc.
+                        }
+
+                        // Get source/target positions
+                        es.upv.mist.slicing.nodes.GraphNode<?> srcNode = sdg.getEdgeSource(arc);
+                        es.upv.mist.slicing.nodes.GraphNode<?> tgtNode = sdg.getEdgeTarget(arc);
+
+                        if (srcNode.getAstNode() == null || tgtNode.getAstNode() == null) continue;
+                        if (!srcNode.getAstNode().getBegin().isPresent() ||
+                            !tgtNode.getAstNode().getBegin().isPresent()) continue;
+
+                        int srcLine = srcNode.getAstNode().getBegin().get().line;
+                        int tgtLine = tgtNode.getAstNode().getBegin().get().line;
+
+                        // Both endpoints must belong to this function's statements
+                        String srcId = lineToNodeId.get(srcLine);
+                        String tgtId = lineToNodeId.get(tgtLine);
+                        if (srcId == null || tgtId == null) continue;
+                        if (srcId.equals(tgtId)) continue;  // skip self-loops
+
+                        String dedupKey = srcId + "|" + tgtId + "|" + edgeType;
+                        if (!edgeDedup.add(dedupKey)) continue;
+
+                        Map<String, Object> edgeInfo = new HashMap<>();
+                        edgeInfo.put("src", srcId);
+                        edgeInfo.put("dst", tgtId);
+                        edgeInfo.put("type", edgeType);
+                        if (arc.isDataDependencyArc() && arc.getLabel() != null) {
+                            edgeInfo.put("label", arc.getLabel());
+                        }
+                        functionEdges.add(edgeInfo);
+                    }
+
                     for (com.github.javaparser.ast.Node varNode : allVars) {
                         String varName = "";
                         int line = -1;
@@ -366,7 +427,6 @@ public class Slicer {
                             Slice bwdSlice = sdg.slice(sc);
 
                             List<Map<String, Object>> nodesData = new ArrayList<>();
-                            List<Statement> statements = callable.findAll(Statement.class);
 
                             // Build a set of backward-sliced line numbers
                             Set<Integer> bwdSlicedLines = new HashSet<>();
@@ -417,7 +477,7 @@ public class Slicer {
                             criterion.put("line", line);
                             sliceData.put("slice_criterion", criterion);
                             sliceData.put("nodes", nodesData);
-                            sliceData.put("edges", new ArrayList<>()); // Empty for now
+                            sliceData.put("edges", functionEdges);
 
                             slices.add(sliceData);
 
