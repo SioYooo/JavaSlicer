@@ -351,12 +351,17 @@ public class Slicer {
                     // --- Hoist statements outside allVars loop (invariant across variables) ---
                     List<Statement> statements = callable.findAll(Statement.class);
 
-                    // Build line -> nodeId mapping (invariant across variables)
+                    // Build position -> nodeId mappings (invariant across variables)
+                    // posToNodeId: exact "line:col" key (handles same-line multi-statement)
+                    // lineToNodeId: line-only fallback (for SDG nodes that are inner expressions)
+                    Map<String, String> posToNodeId = new HashMap<>();
                     Map<Integer, String> lineToNodeId = new HashMap<>();
                     for (Statement stmt : statements) {
                         if (!stmt.getBegin().isPresent()) continue;
                         com.github.javaparser.Position pos = stmt.getBegin().get();
-                        lineToNodeId.putIfAbsent(pos.line, pos.line + ":" + pos.column);
+                        String nodeId = pos.line + ":" + pos.column;
+                        posToNodeId.put(nodeId, nodeId);
+                        lineToNodeId.putIfAbsent(pos.line, nodeId);
                     }
 
                     // --- SDG edge export (once per function) ---
@@ -366,7 +371,7 @@ public class Slicer {
                     for (es.upv.mist.slicing.arcs.Arc arc : sdg.edgeSet()) {
                         if (arc instanceof StructuralArc) continue;
 
-                        // Map arc type -> {DFG, CFG, CG}
+                        // Map arc type -> {DFG, CFG, CG}; skip inter-procedural arcs
                         String edgeType;
                         if (arc.isDataDependencyArc()) {
                             edgeType = "DFG";
@@ -375,7 +380,7 @@ public class Slicer {
                         } else if (arc.isCallArc()) {
                             edgeType = "CG";
                         } else {
-                            edgeType = "DFG";  // ParameterInOut, Return, Summary, etc.
+                            continue;  // Skip ParameterInOut, Return, Summary arcs (inter-procedural noise)
                         }
 
                         // Get source/target positions
@@ -387,11 +392,14 @@ public class Slicer {
                             !tgtNode.getAstNode().getBegin().isPresent()) continue;
 
                         int srcLine = srcNode.getAstNode().getBegin().get().line;
+                        int srcCol = srcNode.getAstNode().getBegin().get().column;
                         int tgtLine = tgtNode.getAstNode().getBegin().get().line;
+                        int tgtCol = tgtNode.getAstNode().getBegin().get().column;
 
                         // Both endpoints must belong to this function's statements
-                        String srcId = lineToNodeId.get(srcLine);
-                        String tgtId = lineToNodeId.get(tgtLine);
+                        // Try exact line:col match first, fall back to line-only
+                        String srcId = posToNodeId.getOrDefault(srcLine + ":" + srcCol, lineToNodeId.get(srcLine));
+                        String tgtId = posToNodeId.getOrDefault(tgtLine + ":" + tgtCol, lineToNodeId.get(tgtLine));
                         if (srcId == null || tgtId == null) continue;
                         if (srcId.equals(tgtId)) continue;  // skip self-loops
 
@@ -474,6 +482,7 @@ public class Slicer {
                                 nodeInfo.put("start_line", stmtPos.line);
                                 stmt.getEnd().ifPresent(end -> nodeInfo.put("end_line", end.line));
                                 nodeInfo.put("col_offset", stmtPos.column);
+                                nodeInfo.put("source_file", relativePath);
                                 String stmtVar = extractVariable(stmt);
                                 if (stmtVar != null) nodeInfo.put("variable", stmtVar);
 
@@ -513,6 +522,25 @@ public class Slicer {
                         funcResult.put("file_name", fileName);
                         funcResult.put("language", "java");
                         funcResult.put("function_code", functionCode);
+                        // Build line-numbered version from original source file
+                        if (cu.getStorage().isPresent()) {
+                            try {
+                                java.nio.file.Path sourcePath = cu.getStorage().get().getPath();
+                                List<String> sourceLines = java.nio.file.Files.readAllLines(sourcePath);
+                                int startLine = callable.getBegin().isPresent()
+                                    ? ((com.github.javaparser.Position) callable.getBegin().get()).line : 1;
+                                int endLine = callable.getEnd().isPresent()
+                                    ? ((com.github.javaparser.Position) callable.getEnd().get()).line : sourceLines.size();
+                                StringBuilder aligned = new StringBuilder();
+                                for (int i = startLine; i <= Math.min(endLine, sourceLines.size()); i++) {
+                                    if (i > startLine) aligned.append("\n");
+                                    aligned.append(i).append("| ").append(sourceLines.get(i - 1));
+                                }
+                                funcResult.put("function_code_aligned", aligned.toString());
+                            } catch (Exception ignored) {
+                                // No aligned code available
+                            }
+                        }
                         funcResult.put("slices", slices);
                         results.add(funcResult);
                     }
@@ -572,6 +600,7 @@ public class Slicer {
         if (stmt instanceof ForStmt || stmt instanceof ForEachStmt) return "for";
         if (stmt instanceof WhileStmt || stmt instanceof DoStmt) return "while";
         if (stmt instanceof ReturnStmt) return "return";
+        if (stmt instanceof ExplicitConstructorInvocationStmt) return "call";
         if (stmt instanceof ExpressionStmt) {
             Expression expr = ((ExpressionStmt) stmt).getExpression();
             if (expr instanceof MethodCallExpr)              return "call";
