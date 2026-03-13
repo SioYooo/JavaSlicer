@@ -11,7 +11,8 @@ import com.github.javaparser.ast.body.Parameter;
 import com.github.javaparser.ast.body.VariableDeclarator;
 import com.github.javaparser.ast.comments.BlockComment;
 import com.github.javaparser.ast.nodeTypes.NodeWithName;
-import com.github.javaparser.ast.stmt.Statement;
+import com.github.javaparser.ast.stmt.*;
+import com.github.javaparser.ast.expr.*;
 import com.github.javaparser.symbolsolver.resolution.typesolvers.JavaParserTypeSolver;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
@@ -468,6 +469,14 @@ public class Slicer {
                                 nodeInfo.put("y_bwd", inBwdSlice ? 1 : 0);
                                 nodeInfo.put("id", stmtPos.line + ":" + stmtPos.column);
 
+                                // New fields for direct dataloader consumption
+                                nodeInfo.put("type", classifyNodeType(stmt));
+                                nodeInfo.put("start_line", stmtPos.line);
+                                stmt.getEnd().ifPresent(end -> nodeInfo.put("end_line", end.line));
+                                nodeInfo.put("col_offset", stmtPos.column);
+                                String stmtVar = extractVariable(stmt);
+                                if (stmtVar != null) nodeInfo.put("variable", stmtVar);
+
                                 nodesData.add(nodeInfo);
                             }
 
@@ -555,6 +564,33 @@ public class Slicer {
         } catch (NoSuchAlgorithmException e) {
             throw new RuntimeException(e);
         }
+    }
+
+    /** Classify a Statement AST node into one of the 11 core node types. */
+    private static String classifyNodeType(Statement stmt) {
+        if (stmt instanceof IfStmt || stmt instanceof SwitchStmt) return "if";
+        if (stmt instanceof ForStmt || stmt instanceof ForEachStmt) return "for";
+        if (stmt instanceof WhileStmt || stmt instanceof DoStmt) return "while";
+        if (stmt instanceof ReturnStmt) return "return";
+        if (stmt instanceof ExpressionStmt) {
+            Expression expr = ((ExpressionStmt) stmt).getExpression();
+            if (expr instanceof MethodCallExpr)              return "call";
+            if (expr instanceof ObjectCreationExpr)           return "call";
+            if (expr instanceof AssignExpr)                   return "assign";
+            if (expr instanceof VariableDeclarationExpr)      return "assign";
+        }
+        return "statement";  // BlockStmt, TryStmt, ThrowStmt, etc.
+    }
+
+    /** Extract the primary variable name from a statement, if applicable. */
+    private static String extractVariable(Statement stmt) {
+        if (!(stmt instanceof ExpressionStmt)) return null;
+        Expression expr = ((ExpressionStmt) stmt).getExpression();
+        if (expr instanceof VariableDeclarationExpr)
+            return ((VariableDeclarationExpr) expr).getVariables().get(0).getNameAsString();
+        if (expr instanceof AssignExpr)
+            return ((AssignExpr) expr).getTarget().toString();
+        return null;
     }
 
     private boolean parse(File file, Set<CompilationUnit> units, List<Problem> problems) {
