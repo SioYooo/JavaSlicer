@@ -16,6 +16,7 @@ import com.github.javaparser.ast.expr.*;
 import com.github.javaparser.symbolsolver.resolution.typesolvers.JavaParserTypeSolver;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
+import es.upv.mist.slicing.arcs.pdg.FlowDependencyArc;
 import es.upv.mist.slicing.arcs.pdg.StructuralArc;
 import es.upv.mist.slicing.graphs.augmented.ASDG;
 import es.upv.mist.slicing.graphs.augmented.PSDG;
@@ -373,7 +374,7 @@ public class Slicer {
 
                         // Map arc type -> {DFG, CFG, CG}; skip inter-procedural arcs
                         String edgeType;
-                        if (arc.isDataDependencyArc()) {
+                        if (arc.isDataDependencyArc() || arc instanceof FlowDependencyArc) {
                             edgeType = "DFG";
                         } else if (arc.isControlFlowArc() || arc.isControlDependencyArc()) {
                             edgeType = "CFG";
@@ -414,6 +415,76 @@ public class Slicer {
                             edgeInfo.put("label", arc.getLabel());
                         }
                         functionEdges.add(edgeInfo);
+                    }
+
+                    // --- Cross-function CG: add callee stub nodes ---
+                    // CallArcs where src is in this function but dst (callee) is external.
+                    // Create stub nodes (type="function") so CG edges are preserved.
+                    Map<String, Map<String, Object>> calleeStubMap = new LinkedHashMap<>();
+                    for (es.upv.mist.slicing.arcs.Arc arc : sdg.edgeSet()) {
+                        if (!arc.isCallArc()) continue;
+
+                        es.upv.mist.slicing.nodes.GraphNode<?> srcNode = sdg.getEdgeSource(arc);
+                        es.upv.mist.slicing.nodes.GraphNode<?> tgtNode = sdg.getEdgeTarget(arc);
+
+                        if (srcNode.getAstNode() == null || tgtNode.getAstNode() == null) continue;
+                        if (!srcNode.getAstNode().getBegin().isPresent() ||
+                            !tgtNode.getAstNode().getBegin().isPresent()) continue;
+
+                        int srcLine = srcNode.getAstNode().getBegin().get().line;
+                        int srcCol = srcNode.getAstNode().getBegin().get().column;
+                        String srcId = posToNodeId.getOrDefault(srcLine + ":" + srcCol, lineToNodeId.get(srcLine));
+                        if (srcId == null) continue;  // src not in this function
+
+                        int tgtLine = tgtNode.getAstNode().getBegin().get().line;
+                        int tgtCol = tgtNode.getAstNode().getBegin().get().column;
+                        String tgtIdLocal = posToNodeId.getOrDefault(tgtLine + ":" + tgtCol, lineToNodeId.get(tgtLine));
+                        if (tgtIdLocal != null) continue;  // both in function, already handled above
+
+                        // External callee — create stub node
+                        String calleeId = "cg_" + tgtLine + "_" + tgtCol;
+
+                        String cgDedupKey = srcId + "|" + calleeId + "|CG";
+                        if (!edgeDedup.add(cgDedupKey)) continue;
+
+                        // Add CG edge
+                        Map<String, Object> cgEdge = new HashMap<>();
+                        cgEdge.put("src", srcId);
+                        cgEdge.put("dst", calleeId);
+                        cgEdge.put("type", "CG");
+                        functionEdges.add(cgEdge);
+
+                        // Build callee stub (dedup)
+                        if (!calleeStubMap.containsKey(calleeId)) {
+                            Map<String, Object> stub = new HashMap<>();
+                            stub.put("id", calleeId);
+                            stub.put("line", tgtLine);
+                            stub.put("col_offset", tgtCol);
+                            stub.put("start_line", tgtLine);
+                            stub.put("type", "function");
+                            // First line of callee code (method signature)
+                            String calleeCode = tgtNode.getAstNode().toString();
+                            int nlIdx = calleeCode.indexOf('\n');
+                            if (nlIdx > 0) calleeCode = calleeCode.substring(0, nlIdx);
+                            stub.put("code", calleeCode);
+                            // Callee source file
+                            String calleeFilePath = relativePath;
+                            Optional<CompilationUnit> calleeCu =
+                                tgtNode.getAstNode().findAncestor(CompilationUnit.class);
+                            if (calleeCu.isPresent() && calleeCu.get().getStorage().isPresent()) {
+                                String absPath = calleeCu.get().getStorage().get().getPath().toString();
+                                for (File includeDir : dirIncludeSet) {
+                                    java.nio.file.Path incPath = includeDir.getAbsoluteFile().toPath().normalize();
+                                    java.nio.file.Path absFilePath = new File(absPath).getAbsoluteFile().toPath().normalize();
+                                    if (absFilePath.startsWith(incPath)) {
+                                        calleeFilePath = incPath.relativize(absFilePath).toString();
+                                        break;
+                                    }
+                                }
+                            }
+                            stub.put("source_file", calleeFilePath);
+                            calleeStubMap.put(calleeId, stub);
+                        }
                     }
 
                     for (com.github.javaparser.ast.Node varNode : allVars) {
@@ -487,6 +558,14 @@ public class Slicer {
                                 if (stmtVar != null) nodeInfo.put("variable", stmtVar);
 
                                 nodesData.add(nodeInfo);
+                            }
+
+                            // Add callee stub nodes for cross-function CG edges
+                            for (Map<String, Object> stub : calleeStubMap.values()) {
+                                Map<String, Object> calleeNode = new HashMap<>(stub);
+                                calleeNode.put("y_fwd", 0);
+                                calleeNode.put("y_bwd", 0);
+                                nodesData.add(calleeNode);
                             }
 
                             Map<String, Object> sliceData = new HashMap<>();
