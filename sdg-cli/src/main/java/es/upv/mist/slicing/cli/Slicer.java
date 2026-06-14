@@ -14,6 +14,7 @@ import com.github.javaparser.ast.nodeTypes.NodeWithName;
 import com.github.javaparser.ast.stmt.*;
 import com.github.javaparser.ast.expr.*;
 import com.github.javaparser.symbolsolver.resolution.typesolvers.JavaParserTypeSolver;
+import com.github.javaparser.symbolsolver.resolution.typesolvers.JarTypeSolver;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import es.upv.mist.slicing.arcs.pdg.FlowDependencyArc;
@@ -112,13 +113,36 @@ public class Slicer {
                 .desc("Slice all variables in the project and export to JSON")
                 .build());
         OPTIONS.addOption(Option
+                .builder("j").longOpt("directed-json")
+                .desc("With -c (directed criterion file#line[:var]), emit the SAME node/edge JSON schema as" +
+                        " -a for the function containing the criterion line (rooted at the oracle statement" +
+                        " line, NOT variable-definition points), instead of writing sliced source.")
+                .build());
+        OPTIONS.addOption(Option
+                .builder("C").longOpt("criteria-file")
+                .hasArg().argName("criteria.txt").type(File.class)
+                .desc("Batch directed-JSON mode (with -j): a text file with one criterion per line in the" +
+                        " format \"absFile#line[:var]\". Builds the SDG ONCE and slices every criterion," +
+                        " emitting one JSON list. Avoids rebuilding the SDG per criterion.")
+                .build());
+        OPTIONS.addOption(Option
                 .builder("p").longOpt("project")
                 .hasArg().argName("project-name")
                 .desc("The name of the project (used for EID generation in -a mode)")
                 .build());
+        OPTIONS.addOption(Option
+                .builder("L").longOpt("classpath")
+                .hasArg().argName("classpath-file-or-jars")
+                .desc("DDSSR: a FILE containing a path-separator-separated classpath of dependency jars" +
+                        " (e.g. the output of `mvn dependency:build-classpath`), OR an inline" +
+                        " path-separator-separated list of jars. Each jar is registered as a JarTypeSolver so" +
+                        " type resolution uses REAL dependency signatures, recovering cross-method call-graph" +
+                        " edges that would otherwise be dropped as unresolved symbols (CG=0).")
+                .build());
     }
 
     private final Set<File> dirIncludeSet = new HashSet<>();
+    private final java.util.List<String> classpathJars = new java.util.ArrayList<>();
     private File outputDir = DEFAULT_OUTPUT_DIR;
     private File scFile;
     private int scLine;
@@ -130,9 +154,9 @@ public class Slicer {
         if (cliOpts.hasOption('h'))
             printHelp();
         
-        if (cliOpts.hasOption('a')) {
-            // In 'all' mode, we don't need specific criterion arguments
-            if (cliOpts.hasOption('c') || (cliOpts.hasOption('f') && cliOpts.hasOption('l'))) {
+        if (cliOpts.hasOption('a') || cliOpts.hasOption('C')) {
+            // In 'all' or batch criteria-file mode, we don't need a single criterion argument
+            if (cliOpts.hasOption('a') && (cliOpts.hasOption('c') || (cliOpts.hasOption('f') && cliOpts.hasOption('l')))) {
                 System.out.println("Warning: Slicing criterion arguments ignored in 'all' mode.");
             }
         } else {
@@ -164,6 +188,24 @@ public class Slicer {
                 if (!dir.isDirectory())
                     throw new ParseException("One of the include directories is not a directory or isn't accesible: " + str);
                 dirIncludeSet.add(dir);
+            }
+        }
+
+        if (cliOpts.hasOption("classpath")) {
+            String val = cliOpts.getOptionValue("classpath");
+            String cp = val;
+            File cpFile = new File(val);
+            if (cpFile.isFile()) {
+                try {
+                    cp = new String(java.nio.file.Files.readAllBytes(cpFile.toPath())).trim();
+                } catch (java.io.IOException e) {
+                    throw new ParseException("Cannot read classpath file: " + val + " (" + e.getMessage() + ")");
+                }
+            }
+            for (String jar : cp.split(java.io.File.pathSeparator)) {
+                jar = jar.trim();
+                if (!jar.isEmpty())
+                    classpathJars.add(jar);
             }
         }
     }
@@ -213,6 +255,19 @@ public class Slicer {
         StaticTypeSolver.addTypeSolverJRE();
         for (File directory : dirIncludeSet)
             StaticTypeSolver.addTypeSolver(new JavaParserTypeSolver(directory));
+        // DDSSR: register REAL dependency signatures so type resolution recovers cross-method CG.
+        int cpOk = 0;
+        for (String jar : classpathJars) {
+            try {
+                StaticTypeSolver.addTypeSolver(new JarTypeSolver(jar));
+                cpOk++;
+            } catch (Exception e) {
+                System.err.println("WARN: cannot load jar typesolver (skipped): " + jar + " (" + e.getMessage() + ")");
+            }
+        }
+        if (!classpathJars.isEmpty())
+            Logger.getLogger(Logger.GLOBAL_LOGGER_NAME).log(Level.INFO,
+                    "DDSSR: registered " + cpOk + "/" + classpathJars.size() + " dependency jars for type resolution");
 
         // Build the SDG
         Logger.getLogger(Logger.GLOBAL_LOGGER_NAME).log(Level.INFO, "Parsing files");
@@ -222,8 +277,8 @@ public class Slicer {
         for (File file : (Iterable<File>) findAllJavaFiles(dirIncludeSet)::iterator)
             scFileFound |= parse(file, units, problems);
         
-        // In 'all' mode, we might not have scFile, but we need to parse all files in include dirs
-        if (!cliOpts.hasOption('a') && !scFileFound)
+        // In 'all'/batch mode, we might not have scFile, but we need to parse all files in include dirs
+        if (!cliOpts.hasOption('a') && !cliOpts.hasOption('C') && !scFileFound)
             parse(scFile, units, problems);
             
         if (!problems.isEmpty()) {
@@ -273,6 +328,11 @@ public class Slicer {
 
         if (cliOpts.hasOption('a')) {
             sliceAll(sdg, units);
+            return;
+        }
+
+        if (cliOpts.hasOption('j')) {
+            sliceDirectedJson(sdg, units);
             return;
         }
 
@@ -641,6 +701,265 @@ public class Slicer {
         } catch (IOException e) {
             e.printStackTrace();
         }
+    }
+
+    /** Relativize an absolute file path against the include dirs (same logic sliceAll inlines). */
+    private String relativizePath(String filePath) {
+        for (File includeDir : dirIncludeSet) {
+            java.nio.file.Path inc = includeDir.getAbsoluteFile().toPath().normalize();
+            java.nio.file.Path abs = new File(filePath).getAbsoluteFile().toPath().normalize();
+            if (abs.startsWith(inc)) return inc.relativize(abs).toString();
+        }
+        return filePath;
+    }
+
+    /** DIRECTED-JSON mode (-c ... -j): emit the SAME per-function node/edge JSON schema as sliceAll, but
+     *  rooted at the oracle criterion (scFile#scLine[:scVar]) — i.e. the criterion line is the oracle
+     *  STATEMENT line, not a variable-definition point. Only the function CONTAINING scLine is emitted
+     *  (matching the GNN's per-function training unit). A top-level `all_slice_nodes` records every
+     *  (source_file,line,y_bwd,y_fwd) in the FULL interprocedural backward/forward slice, so callers can
+     *  separate graph VISIBILITY (can the slice even contain the witness) from MODEL SELECTION. */
+    /** Driver: build the criteria list (single -c, or batch -C file) and emit one JSON list. The SDG is
+     *  built ONCE by the caller, so batch mode slices every oracle criterion without rebuilding it. */
+    private void sliceDirectedJson(SDG sdg, Set<CompilationUnit> units) {
+        List<Map<String, Object>> results = new ArrayList<>();
+        List<File> cFiles = new ArrayList<>();
+        List<Integer> cLines = new ArrayList<>();
+        List<String> cVars = new ArrayList<>();
+        if (cliOpts.hasOption('C')) {
+            File critFile = new File(cliOpts.getOptionValue('C'));
+            try {
+                for (String ln : java.nio.file.Files.readAllLines(critFile.toPath())) {
+                    ln = ln.trim();
+                    if (ln.isEmpty() || ln.startsWith("#")) continue;
+                    Matcher m = SC_PATTERN.matcher(ln);
+                    if (!m.matches()) { System.err.println("DIRECTED: bad criterion line: " + ln); continue; }
+                    cFiles.add(new File(m.group("file")));
+                    cLines.add(Integer.parseInt(m.group("line")));
+                    cVars.add(m.group("var"));  // may be null
+                }
+            } catch (IOException e) {
+                System.err.println("DIRECTED: cannot read criteria file " + critFile + ": " + e.getMessage());
+            }
+        } else {
+            cFiles.add(scFile); cLines.add(scLine); cVars.add(scVar);
+        }
+        for (int i = 0; i < cFiles.size(); i++) {
+            try {
+                results.addAll(directedSliceOne(sdg, units, cFiles.get(i), cLines.get(i), cVars.get(i)));
+            } catch (Throwable t) {
+                System.err.println("DIRECTED: criterion " + cFiles.get(i).getName() + "#" + cLines.get(i)
+                        + " failed: " + t.getMessage());
+            }
+        }
+        Gson gson = new GsonBuilder().setPrettyPrinting().create();
+        File jsonFile = new File(outputDir, "slicing_result.json");
+        outputDir.mkdirs();
+        try (FileWriter writer = new FileWriter(jsonFile)) {
+            gson.toJson(results, writer);
+            Logger.getLogger(Logger.GLOBAL_LOGGER_NAME).log(Level.INFO, "DIRECTED: exported "
+                    + results.size() + " function-result(s) for " + cFiles.size() + " criterion(s) to " + jsonFile.getAbsolutePath());
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    /** Directed slice for ONE criterion (critFile#critLine[:critVar]) -> per-function results in the -a
+     *  schema, rooted at the oracle statement line. Returns the function-result list (empty if the line
+     *  is not inside any method or the slice is empty). */
+    @SuppressWarnings("unchecked")
+    private List<Map<String, Object>> directedSliceOne(SDG sdg, Set<CompilationUnit> units, File scFile, int scLine, String scVar) {
+        String projectName = cliOpts.getOptionValue("p", "unknown_project");
+        List<Map<String, Object>> results = new ArrayList<>();
+
+        // --- Slice ONCE at the oracle criterion (scVar may be null => whole line) ---
+        Set<Integer> bwdSlicedLines = new HashSet<>();
+        Set<Integer> fwdSlicedLines = new HashSet<>();
+        List<Map<String, Object>> allSliceNodes = new ArrayList<>();
+        boolean sliceOk = false;
+        try {
+            SlicingCriterion sc = new FileLineSlicingCriterion(scFile, scLine, scVar);
+            Slice bwdSlice = sdg.slice(sc);
+            for (es.upv.mist.slicing.nodes.GraphNode<?> gn : bwdSlice.getGraphNodes())
+                if (gn.getAstNode() != null && gn.getAstNode().getBegin().isPresent())
+                    bwdSlicedLines.add(gn.getAstNode().getBegin().get().line);
+            Set<es.upv.mist.slicing.nodes.GraphNode<?>> critNodes = sc.findNode(sdg);
+            Slice fwdSlice = new ForwardClassicSlicingAlgorithm(sdg).traverse(critNodes);
+            for (es.upv.mist.slicing.nodes.GraphNode<?> gn : fwdSlice.getGraphNodes())
+                if (gn.getAstNode() != null && gn.getAstNode().getBegin().isPresent())
+                    fwdSlicedLines.add(gn.getAstNode().getBegin().get().line);
+            // interprocedural visibility ceiling: every node across the whole bwd/fwd slice
+            Set<es.upv.mist.slicing.nodes.GraphNode<?>> all = new HashSet<>();
+            all.addAll(bwdSlice.getGraphNodes());
+            all.addAll(fwdSlice.getGraphNodes());
+            Set<String> seen = new HashSet<>();
+            for (es.upv.mist.slicing.nodes.GraphNode<?> gn : all) {
+                if (gn.getAstNode() == null || !gn.getAstNode().getBegin().isPresent()) continue;
+                int ln = gn.getAstNode().getBegin().get().line;
+                String sf = "";
+                Optional<CompilationUnit> ncu = gn.getAstNode().findAncestor(CompilationUnit.class);
+                if (ncu.isPresent() && ncu.get().getStorage().isPresent())
+                    sf = relativizePath(ncu.get().getStorage().get().getPath().toString());
+                if (!seen.add(sf + "#" + ln)) continue;
+                Map<String, Object> m = new HashMap<>();
+                m.put("source_file", sf);
+                m.put("line", ln);
+                m.put("y_bwd", bwdSlicedLines.contains(ln) ? 1 : 0);
+                m.put("y_fwd", fwdSlicedLines.contains(ln) ? 1 : 0);
+                allSliceNodes.add(m);
+            }
+            sliceOk = true;
+        } catch (Exception e) {
+            System.err.println("DIRECTED: slicing failed at " + scFile.getName() + "#" + scLine + ": " + e.getMessage());
+        }
+
+        // --- Emit the function CONTAINING scLine, in the -a per-function schema ---
+        for (CompilationUnit cu : units) {
+            if (cu.getStorage().isEmpty()) continue;
+            java.nio.file.Path cuPath = cu.getStorage().get().getPath().toAbsolutePath().normalize();
+            if (!cuPath.equals(scFile.getAbsoluteFile().toPath().normalize())) continue;
+            String filePath = cu.getStorage().get().getPath().toString();
+            String fileName = cu.getStorage().get().getFileName();
+            String relativePath = relativizePath(filePath);
+
+            for (CallableDeclaration callable : (List<CallableDeclaration>) cu.findAll(CallableDeclaration.class)) {
+                if (!callable.getBegin().isPresent() || !callable.getEnd().isPresent()) continue;
+                if (scLine < ((com.github.javaparser.Position) callable.getBegin().get()).line
+                        || scLine > ((com.github.javaparser.Position) callable.getEnd().get()).line) continue;
+                try {
+                    String functionName = callable.getNameAsString();
+                    String className = "";
+                    if (callable.getParentNode().isPresent() && callable.getParentNode().get() instanceof com.github.javaparser.ast.body.TypeDeclaration)
+                        className = ((com.github.javaparser.ast.body.TypeDeclaration<?>) callable.getParentNode().get()).getNameAsString();
+                    String functionCode = callable.toString();
+
+                    List<Statement> statements = callable.findAll(Statement.class);
+                    Map<String, String> posToNodeId = new HashMap<>();
+                    Map<Integer, String> lineToNodeId = new HashMap<>();
+                    for (Statement stmt : statements) {
+                        if (!stmt.getBegin().isPresent()) continue;
+                        com.github.javaparser.Position pos = stmt.getBegin().get();
+                        String nodeId = pos.line + ":" + pos.column;
+                        posToNodeId.put(nodeId, nodeId);
+                        lineToNodeId.putIfAbsent(pos.line, nodeId);
+                    }
+
+                    // edges (DFG/CFG/CG intra) — identical filter to sliceAll
+                    Set<String> edgeDedup = new HashSet<>();
+                    List<Map<String, Object>> functionEdges = new ArrayList<>();
+                    for (es.upv.mist.slicing.arcs.Arc arc : sdg.edgeSet()) {
+                        if (arc instanceof StructuralArc) continue;
+                        String edgeType;
+                        if (arc.isDataDependencyArc() || arc instanceof FlowDependencyArc) edgeType = "DFG";
+                        else if (arc.isControlFlowArc() || arc.isControlDependencyArc()) edgeType = "CFG";
+                        else if (arc.isCallArc()) edgeType = "CG";
+                        else continue;
+                        es.upv.mist.slicing.nodes.GraphNode<?> srcNode = sdg.getEdgeSource(arc);
+                        es.upv.mist.slicing.nodes.GraphNode<?> tgtNode = sdg.getEdgeTarget(arc);
+                        if (srcNode.getAstNode() == null || tgtNode.getAstNode() == null) continue;
+                        if (!srcNode.getAstNode().getBegin().isPresent() || !tgtNode.getAstNode().getBegin().isPresent()) continue;
+                        int srcLine = srcNode.getAstNode().getBegin().get().line, srcCol = srcNode.getAstNode().getBegin().get().column;
+                        int tgtLine = tgtNode.getAstNode().getBegin().get().line, tgtCol = tgtNode.getAstNode().getBegin().get().column;
+                        String srcId = posToNodeId.getOrDefault(srcLine + ":" + srcCol, lineToNodeId.get(srcLine));
+                        String tgtId = posToNodeId.getOrDefault(tgtLine + ":" + tgtCol, lineToNodeId.get(tgtLine));
+                        if (srcId == null || tgtId == null || srcId.equals(tgtId)) continue;
+                        if (!edgeDedup.add(srcId + "|" + tgtId + "|" + edgeType)) continue;
+                        Map<String, Object> edgeInfo = new HashMap<>();
+                        edgeInfo.put("src", srcId); edgeInfo.put("dst", tgtId); edgeInfo.put("type", edgeType);
+                        if (arc.isDataDependencyArc() && arc.getLabel() != null) edgeInfo.put("label", arc.getLabel());
+                        functionEdges.add(edgeInfo);
+                    }
+                    // cross-function CG stubs (identical to sliceAll)
+                    Map<String, Map<String, Object>> calleeStubMap = new LinkedHashMap<>();
+                    for (es.upv.mist.slicing.arcs.Arc arc : sdg.edgeSet()) {
+                        if (!arc.isCallArc()) continue;
+                        es.upv.mist.slicing.nodes.GraphNode<?> srcNode = sdg.getEdgeSource(arc);
+                        es.upv.mist.slicing.nodes.GraphNode<?> tgtNode = sdg.getEdgeTarget(arc);
+                        if (srcNode.getAstNode() == null || tgtNode.getAstNode() == null) continue;
+                        if (!srcNode.getAstNode().getBegin().isPresent() || !tgtNode.getAstNode().getBegin().isPresent()) continue;
+                        int srcLine = srcNode.getAstNode().getBegin().get().line, srcCol = srcNode.getAstNode().getBegin().get().column;
+                        String srcId = posToNodeId.getOrDefault(srcLine + ":" + srcCol, lineToNodeId.get(srcLine));
+                        if (srcId == null) continue;
+                        int tgtLine = tgtNode.getAstNode().getBegin().get().line, tgtCol = tgtNode.getAstNode().getBegin().get().column;
+                        if (posToNodeId.getOrDefault(tgtLine + ":" + tgtCol, lineToNodeId.get(tgtLine)) != null) continue;
+                        String calleeId = "cg_" + tgtLine + "_" + tgtCol;
+                        if (!edgeDedup.add(srcId + "|" + calleeId + "|CG")) continue;
+                        Map<String, Object> cgEdge = new HashMap<>();
+                        cgEdge.put("src", srcId); cgEdge.put("dst", calleeId); cgEdge.put("type", "CG");
+                        functionEdges.add(cgEdge);
+                        if (!calleeStubMap.containsKey(calleeId)) {
+                            Map<String, Object> stub = new HashMap<>();
+                            stub.put("id", calleeId); stub.put("line", tgtLine); stub.put("col_offset", tgtCol);
+                            stub.put("start_line", tgtLine); stub.put("type", "function");
+                            String calleeCode = tgtNode.getAstNode().toString();
+                            int nlIdx = calleeCode.indexOf('\n');
+                            if (nlIdx > 0) calleeCode = calleeCode.substring(0, nlIdx);
+                            stub.put("code", calleeCode);
+                            String calleeFilePath = relativePath;
+                            Optional<CompilationUnit> calleeCu = tgtNode.getAstNode().findAncestor(CompilationUnit.class);
+                            if (calleeCu.isPresent() && calleeCu.get().getStorage().isPresent())
+                                calleeFilePath = relativizePath(calleeCu.get().getStorage().get().getPath().toString());
+                            stub.put("source_file", calleeFilePath);
+                            calleeStubMap.put(calleeId, stub);
+                        }
+                    }
+
+                    // nodes: this function's statements, labelled by the criterion's bwd/fwd slice
+                    List<Map<String, Object>> nodesData = new ArrayList<>();
+                    for (Statement stmt : statements) {
+                        if (!stmt.getBegin().isPresent()) continue;
+                        com.github.javaparser.Position stmtPos = stmt.getBegin().get();
+                        Map<String, Object> nodeInfo = new HashMap<>();
+                        nodeInfo.put("line", stmtPos.line);
+                        nodeInfo.put("code", stmt.toString());
+                        nodeInfo.put("y_fwd", fwdSlicedLines.contains(stmtPos.line) ? 1 : 0);
+                        nodeInfo.put("y_bwd", bwdSlicedLines.contains(stmtPos.line) ? 1 : 0);
+                        nodeInfo.put("id", stmtPos.line + ":" + stmtPos.column);
+                        nodeInfo.put("type", classifyNodeType(stmt));
+                        nodeInfo.put("start_line", stmtPos.line);
+                        stmt.getEnd().ifPresent(end -> nodeInfo.put("end_line", end.line));
+                        nodeInfo.put("col_offset", stmtPos.column);
+                        nodeInfo.put("source_file", relativePath);
+                        String stmtVar = extractVariable(stmt);
+                        if (stmtVar != null) nodeInfo.put("variable", stmtVar);
+                        nodesData.add(nodeInfo);
+                    }
+                    for (Map<String, Object> stub : calleeStubMap.values()) {
+                        Map<String, Object> calleeNode = new HashMap<>(stub);
+                        calleeNode.put("y_fwd", 0); calleeNode.put("y_bwd", 0);
+                        nodesData.add(calleeNode);
+                    }
+
+                    Map<String, Object> sliceData = new HashMap<>();
+                    Map<String, Object> criterion = new HashMap<>();
+                    criterion.put("variable", scVar == null ? "" : scVar);
+                    criterion.put("line", scLine);  // ROOTED AT ORACLE LINE, not a variable-def line
+                    sliceData.put("slice_criterion", criterion);
+                    sliceData.put("nodes", nodesData);
+                    sliceData.put("edges", functionEdges);
+
+                    Map<String, Object> funcResult = new HashMap<>();
+                    funcResult.put("eid", generateHash(projectName + "|" + relativePath + "|" + functionName + "|" + scLine));
+                    funcResult.put("project_name", projectName);
+                    funcResult.put("function_name", functionName);
+                    funcResult.put("class_name", className);
+                    funcResult.put("file_name", fileName);
+                    funcResult.put("language", "java");
+                    funcResult.put("function_code", functionCode);
+                    funcResult.put("criterion_line", scLine);
+                    funcResult.put("criterion_file", relativePath);
+                    funcResult.put("slice_ok", sliceOk);
+                    funcResult.put("all_slice_nodes", allSliceNodes);
+                    List<Map<String, Object>> slices = new ArrayList<>();
+                    slices.add(sliceData);
+                    funcResult.put("slices", slices);
+                    results.add(funcResult);
+                } catch (Throwable t) {
+                    System.err.println("DIRECTED: failed function " + callable.getNameAsString() + ": " + t.getMessage());
+                }
+            }
+        }
+        return results;
     }
 
     private void outputEmptyResult() {
