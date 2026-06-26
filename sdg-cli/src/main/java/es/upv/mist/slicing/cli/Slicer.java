@@ -113,6 +113,14 @@ public class Slicer {
                 .desc("Slice all variables in the project and export to JSON")
                 .build());
         OPTIONS.addOption(Option
+                .builder("g").longOpt("dump-sdg")
+                .desc("Dump the WHOLE-PROGRAM SDG (every node + every directed edge, edge"
+                        + " types DATA/PARAM_IN/PARAM_OUT/RETURN/SUMMARY/CALL/CONTROL) to"
+                        + " sdg_dump.json for the CQS client-closure substrate. Like -a it"
+                        + " needs no criterion. Read-only: re-serializes the built SDG, adds"
+                        + " no analysis.")
+                .build());
+        OPTIONS.addOption(Option
                 .builder("j").longOpt("directed-json")
                 .desc("With -c (directed criterion file#line[:var]), emit the SAME node/edge JSON schema as" +
                         " -a for the function containing the criterion line (rooted at the oracle statement" +
@@ -154,7 +162,7 @@ public class Slicer {
         if (cliOpts.hasOption('h'))
             printHelp();
         
-        if (cliOpts.hasOption('a') || cliOpts.hasOption('C')) {
+        if (cliOpts.hasOption('a') || cliOpts.hasOption('C') || cliOpts.hasOption('g')) {
             // In 'all' or batch criteria-file mode, we don't need a single criterion argument
             if (cliOpts.hasOption('a') && (cliOpts.hasOption('c') || (cliOpts.hasOption('f') && cliOpts.hasOption('l')))) {
                 System.out.println("Warning: Slicing criterion arguments ignored in 'all' mode.");
@@ -277,8 +285,8 @@ public class Slicer {
         for (File file : (Iterable<File>) findAllJavaFiles(dirIncludeSet)::iterator)
             scFileFound |= parse(file, units, problems);
         
-        // In 'all'/batch mode, we might not have scFile, but we need to parse all files in include dirs
-        if (!cliOpts.hasOption('a') && !cliOpts.hasOption('C') && !scFileFound)
+        // In 'all'/batch/dump-sdg mode, we might not have scFile, but we need to parse all files in include dirs
+        if (!cliOpts.hasOption('a') && !cliOpts.hasOption('C') && !cliOpts.hasOption('g') && !scFileFound)
             parse(scFile, units, problems);
             
         if (!problems.isEmpty()) {
@@ -326,6 +334,11 @@ public class Slicer {
             throw new RuntimeException("SDG build failed", e);
         }
 
+        if (cliOpts.hasOption('g')) {
+            dumpSdg(sdg, units);
+            return;
+        }
+
         if (cliOpts.hasOption('a')) {
             sliceAll(sdg, units);
             return;
@@ -358,6 +371,157 @@ public class Slicer {
                 System.err.println("Could not write file " + javaFile);
             }
         }
+    }
+
+    /** Dump the WHOLE-PROGRAM SDG for the CQS client-closure substrate. Unlike -a
+     *  (per-function, per-criterion, intra-function edges for GNN training), this
+     *  walks sdg.edgeSet() ONCE and emits every node (keyed by the graph-unique
+     *  GraphNode id) and every directed edge with a SOUND type label:
+     *    value-carrying (the witness value can actually travel):
+     *        DATA / PARAM_IN / PARAM_OUT / RETURN / SUMMARY
+     *    control-only (forcing / activation ONLY, never proves value flow):
+     *        CALL / CONTROL
+     *  Endpoints are the long graph ids (always present); file/line/col/method are
+     *  emitted per node so the Python adapter can map a (file,line) witness/
+     *  criterion to its statement node (multivalued/missing -> the adapter
+     *  abstains -> UNKNOWN). Read-only: builds nothing new, re-serializes the
+     *  already-built SDG. */
+    private void dumpSdg(SDG sdg, Set<CompilationUnit> units) {
+        Logger.getLogger(Logger.GLOBAL_LOGGER_NAME).log(Level.INFO,
+                "Dumping whole-program SDG (CQS client-closure substrate)...");
+        String projectName = cliOpts.getOptionValue("p", "unknown_project");
+
+        Map<Long, Map<String, Object>> nodeMap = new LinkedHashMap<>();
+        List<Map<String, Object>> edges = new ArrayList<>();
+        Set<String> edgeDedup = new HashSet<>();
+
+        for (es.upv.mist.slicing.arcs.Arc arc : sdg.edgeSet()) {
+            if (arc instanceof StructuralArc) continue;
+
+            String type;
+            if (arc.isDataDependencyArc()
+                    || arc instanceof FlowDependencyArc
+                    || arc instanceof es.upv.mist.slicing.arcs.pdg.ObjectFlowDependencyArc
+                    || arc instanceof es.upv.mist.slicing.arcs.pdg.TotalDefinitionDependenceArc) {
+                type = "DATA";
+            } else if (arc instanceof es.upv.mist.slicing.arcs.sdg.ReturnArc) {
+                type = "RETURN";
+            } else if (arc.isParameterInOutArc()) {
+                if (arc.isInterproceduralInputArc()) type = "PARAM_IN";
+                else if (arc.isInterproceduralOutputArc()) type = "PARAM_OUT";
+                else type = "PARAM";
+            } else if (arc.isSummaryArc()) {
+                type = "SUMMARY";
+            } else if (arc.isCallArc()) {
+                type = "CALL";
+            } else if (arc.isControlDependencyArc() || arc.isControlFlowArc()) {
+                type = "CONTROL";
+            } else {
+                type = "OTHER";
+            }
+
+            es.upv.mist.slicing.nodes.GraphNode<?> s =
+                    (es.upv.mist.slicing.nodes.GraphNode<?>) sdg.getEdgeSource(arc);
+            es.upv.mist.slicing.nodes.GraphNode<?> t =
+                    (es.upv.mist.slicing.nodes.GraphNode<?>) sdg.getEdgeTarget(arc);
+            long sid = s.getId();
+            long tid = t.getId();
+            if (sid == tid) continue;
+
+            registerSdgNode(s, nodeMap);
+            registerSdgNode(t, nodeMap);
+
+            String dk = sid + "|" + tid + "|" + type;
+            if (!edgeDedup.add(dk)) continue;
+
+            Map<String, Object> e = new HashMap<>();
+            e.put("src", sid);
+            e.put("dst", tid);
+            e.put("type", type);
+            e.put("arc_class", arc.getClass().getSimpleName());
+            String lbl = arc.getLabel();
+            if (lbl != null && !lbl.isEmpty()) e.put("var", lbl);
+            edges.add(e);
+        }
+
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("project_name", projectName);
+        out.put("graph_type", cliOpts.getOptionValue("type", "JSysDG"));
+        out.put("n_nodes", nodeMap.size());
+        out.put("n_edges", edges.size());
+        out.put("nodes", new ArrayList<>(nodeMap.values()));
+        out.put("edges", edges);
+
+        Gson gson = new GsonBuilder().setPrettyPrinting().create();
+        outputDir.mkdirs();
+        File jsonFile = new File(outputDir, "sdg_dump.json");
+        try (FileWriter writer = new FileWriter(jsonFile)) {
+            gson.toJson(out, writer);
+            Logger.getLogger(Logger.GLOBAL_LOGGER_NAME).log(Level.INFO,
+                    "Wrote SDG dump: " + nodeMap.size() + " nodes, " + edges.size()
+                            + " edges -> " + jsonFile);
+        } catch (IOException ex) {
+            System.err.println("ERROR writing SDG dump: " + ex.getMessage());
+        }
+    }
+
+    /** Register one SDG node (by graph-unique id) with its source coordinates and
+     *  enclosing method signature, for the adapter's (file,line) -> node mapping.
+     *  Synthetic / IO nodes with no AST position get only an id; they still
+     *  participate in graph connectivity via their id but are never used as a
+     *  mapping target. */
+    private void registerSdgNode(es.upv.mist.slicing.nodes.GraphNode<?> node,
+                                 Map<Long, Map<String, Object>> nodeMap) {
+        long id = node.getId();
+        if (nodeMap.containsKey(id)) return;
+        Map<String, Object> rec = new HashMap<>();
+        rec.put("id", id);
+        rec.put("graph_node_class", node.getClass().getSimpleName());
+        com.github.javaparser.ast.Node ast = node.getAstNode();
+        if (ast != null) {
+            if (ast.getBegin().isPresent()) {
+                rec.put("line", ast.getBegin().get().line);
+                rec.put("col", ast.getBegin().get().column);
+            }
+            ast.getEnd().ifPresent(p -> rec.put("end_line", p.line));
+            Optional<CompilationUnit> cu = ast.findAncestor(CompilationUnit.class);
+            if (cu.isPresent() && cu.get().getStorage().isPresent()) {
+                rec.put("file", relativizeToIncludes(
+                        cu.get().getStorage().get().getPath().toString()));
+            }
+            Optional<CallableDeclaration> cd = ast.findAncestor(CallableDeclaration.class);
+            if (cd.isPresent()) {
+                rec.put("method", callableSignature(cd.get()));
+                if (cd.get().getParentNode().isPresent()
+                        && cd.get().getParentNode().get() instanceof com.github.javaparser.ast.body.TypeDeclaration) {
+                    rec.put("class", ((com.github.javaparser.ast.body.TypeDeclaration<?>)
+                            cd.get().getParentNode().get()).getNameAsString());
+                }
+            }
+            rec.put("kind", ast.getClass().getSimpleName());
+            String code = ast.toString();
+            int nl = code.indexOf('\n');
+            rec.put("code", nl > 0 ? code.substring(0, nl) : code);
+        }
+        nodeMap.put(id, rec);
+    }
+
+    private String relativizeToIncludes(String absPath) {
+        for (File includeDir : dirIncludeSet) {
+            java.nio.file.Path inc = includeDir.getAbsoluteFile().toPath().normalize();
+            java.nio.file.Path f = new File(absPath).getAbsoluteFile().toPath().normalize();
+            if (f.startsWith(inc)) return inc.relativize(f).toString();
+        }
+        return absPath;
+    }
+
+    private String callableSignature(CallableDeclaration cd) {
+        StringBuilder sb = new StringBuilder(cd.getNameAsString()).append("(");
+        for (int i = 0; i < cd.getParameters().size(); i++) {
+            if (i > 0) sb.append(",");
+            sb.append(cd.getParameter(i).getType().asString());
+        }
+        return sb.append(")").toString();
     }
 
     private void sliceAll(SDG sdg, Set<CompilationUnit> units) {
